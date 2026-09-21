@@ -78,7 +78,7 @@ class _LLSAMetadata(AttentionMetadata):
 
 
 class _LLSACallBuilder:
-    """Adapts to minor API variations across llsa varlen kernels."""
+    """Adapts to minor API variations across LLSA varlen kernels (4D BHLD input)."""
 
     def __init__(self, kernel: Callable[..., torch.Tensor]) -> None:
         self.kernel = kernel
@@ -86,11 +86,9 @@ class _LLSACallBuilder:
 
     def call(
         self,
-        q_flat: torch.Tensor,
-        k_flat: torch.Tensor,
-        v_flat: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        max_seqlen: int,
+        q_bhld: torch.Tensor,
+        k_bhld: torch.Tensor,
+        v_bhld: torch.Tensor,
         *,
         is_causal: bool,
         scale: float | None,
@@ -99,24 +97,8 @@ class _LLSACallBuilder:
         dropout_p: float = 0.0,
     ) -> torch.Tensor:
         # Positional QKV first (shared across signatures)
-        args: list[Any] = [q_flat, k_flat, v_flat]
+        args: list[Any] = [q_bhld, k_bhld, v_bhld]
         kwargs: dict[str, Any] = {}
-
-        # Varlen seqlens/maxlen (q-only or q/k)
-        if "cu_seqlens" in self.params:
-            kwargs["cu_seqlens"] = cu_seqlens
-        else:
-            if "cu_seqlens_q" in self.params:
-                kwargs["cu_seqlens_q"] = cu_seqlens
-            if "cu_seqlens_k" in self.params:
-                kwargs["cu_seqlens_k"] = cu_seqlens
-        if "max_seqlen" in self.params:
-            kwargs["max_seqlen"] = max_seqlen
-        else:
-            if "max_seqlen_q" in self.params:
-                kwargs["max_seqlen_q"] = max_seqlen
-            if "max_seqlen_k" in self.params:
-                kwargs["max_seqlen_k"] = max_seqlen
 
         # Causality (documented unsupported; pass through when present)
         if "is_causal" in self.params:
@@ -149,11 +131,20 @@ class _LLSACallBuilder:
         elif "p_dropout" in self.params:
             kwargs["p_dropout"] = dropout_p
 
+        # Try with full kwargs → progressively back off if needed
         try:
             return self.kernel(*args, **kwargs)
         except TypeError:
-            # Fallback: minimal varlen signature
-            return self.kernel(q_flat, k_flat, v_flat, cu_seqlens, max_seqlen)
+            # Remove rarely used kwargs first
+            for key in ("dropout_p", "p_dropout", "k_topk", "v_topk", "top_k", "topk", "softmax_scale", "scale"):
+                if key in kwargs:
+                    kwargs.pop(key, None)
+                    try:
+                        return self.kernel(*args, **kwargs)
+                    except TypeError:
+                        continue
+            # Final fallback: only positional args (q, k, v)
+            return self.kernel(*args)
 
 
 class LLSAAttentionImpl(AttentionImpl):
@@ -168,6 +159,8 @@ class LLSAAttentionImpl(AttentionImpl):
         prefix: str = "",
         **extra_impl_args,
     ) -> None:
+        self.num_heads = num_heads
+        self.head_size = head_size
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.dropout = float(extra_impl_args.get("dropout_p", 0.0) or 0.0)
@@ -193,42 +186,44 @@ class LLSAAttentionImpl(AttentionImpl):
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         """
-        Inputs are [B, H, L, D] and contiguous (preprocess_qkv applied).
-        Returns [B, H, L, D].
+        Accepts [B, L, H, D] (LocalAttention) or [B, H, L, D] (Distributed after preprocess_qkv).
+        Calls LLSA kernel with [B, H, L, D] and returns:
+          - [B, L, H, D] for LocalAttention inputs,
+          - [B, H, L, D] for DistributedAttention inputs (postprocess handles the final permute).
         """
         if query.dim() != 4:
-            raise ValueError(f"Expected query with 4 dims [B,H,L,D], got {query.shape}")
-        B, H, L, D = query.shape
+            raise ValueError(f"Expected 4D query tensor, got {tuple(query.shape)}")
 
+        # Detect layout and convert to BHLD for the kernel
+        input_is_nhd = False
+        if query.shape[2] == getattr(self, "num_heads", query.shape[2]):
+            # [B, L, H, D] → [B, H, L, D]
+            input_is_nhd = True
+            q_bhld = query.permute(0, 2, 1, 3).contiguous()
+            k_bhld = key.permute(0, 2, 1, 3).contiguous()
+            v_bhld = value.permute(0, 2, 1, 3).contiguous()
+        else:
+            # Already [B, H, L, D]
+            q_bhld, k_bhld, v_bhld = query, key, value
+
+        B, H, L, D = q_bhld.shape
         # Choose kernel by sequence length
         kernel = self._l1 if L <= _LLSA_L2_THRESHOLD else self._l2
         call = _LLSACallBuilder(kernel)
 
-        # Flatten across batch for varlen API: [(B*L), H, D]
-        q_bld = query.permute(0, 2, 1, 3).contiguous()  # [B, L, H, D]
-        k_bld = key.permute(0, 2, 1, 3).contiguous()
-        v_bld = value.permute(0, 2, 1, 3).contiguous()
-        q_flat = q_bld.reshape(B * L, H, D)
-        k_flat = k_bld.reshape(B * L, H, D)
-        v_flat = v_bld.reshape(B * L, H, D)
-
-        # Varlen offsets: uniform lengths across batch
-        cu_seqlens = torch.arange(0, (B + 1) * L, L, device=query.device, dtype=torch.int32)
-        max_seqlen = int(L)
-
-        out_flat = call.call(q_flat,
-                             k_flat,
-                             v_flat,
-                             cu_seqlens,
-                             max_seqlen,
+        out_bhld = call.call(q_bhld,
+                             k_bhld,
+                             v_bhld,
                              is_causal=self.causal,
                              scale=self.softmax_scale,
                              block_size=_DEFAULT_BLOCK_SIZE,
                              topk=min(_DEFAULT_TOPK, L),
                              dropout_p=self.dropout)
-        # Restore to [B, H, L, D]
-        out_bld = out_flat.reshape(B, L, H, D)
-        return out_bld.permute(0, 2, 1, 3).contiguous()
+
+        # Convert back only for LocalAttention (NHD input)
+        if input_is_nhd:
+            return out_bhld.permute(0, 2, 1, 3).contiguous()
+        return out_bhld
 
     def postprocess_output(
         self,
