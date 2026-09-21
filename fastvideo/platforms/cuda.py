@@ -296,6 +296,20 @@ class CudaPlatformBase(Platform):
                 logger.error("Failed to import SageSLA Attention backend: %s", str(e))
                 raise ImportError("SageSLA Attention backend requires spas_sage_attn. "
                                   "Install with: uv pip install git+https://github.com/thu-ml/SpargeAttn.git") from e
+        elif selected_backend == AttentionBackendEnum.LLSA_ATTN:
+            try:
+                # Presence probe only; the backend module performs the actual imports.
+                from llsa.kernel.torch_op.flash_sparse_attention_res_1_varlen import llsa_l1_varlen  # noqa: F401
+                from llsa.kernel.torch_op.flash_sparse_attention_res_2_varlen import llsa_l2_varlen  # noqa: F401
+                logger.info("Using LLSA (Log-Linear Sparse Attention) backend.")
+                return "fastvideo.attention.backends.llsa_attn.LLSAAttentionBackend"
+            except ImportError as e:
+                logger.error("Failed to import LLSA Attention backend: %s", str(e))
+                raise ImportError(
+                    "LLSA_ATTN selected but the external 'llsa' package is not installed. "
+                    "Install it with: pip install -e git+https://github.com/SingleZombie/LLSA.git "
+                    "(note: S-Lab License 1.0, non-commercial)."
+                ) from e
         elif selected_backend == AttentionBackendEnum.TORCH_SDPA:
             logger.info("Using Torch SDPA backend.")
             return "fastvideo.attention.backends.sdpa.SDPABackend"
